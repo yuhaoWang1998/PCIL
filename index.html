@@ -18,7 +18,8 @@
 <section id="abstract" class="container my-5">
   <h2 class="text-center">Abstract</h2>
   <div class="mt-3" style="max-width:900px; margin:auto; font-size:1.1em;">
-    Active visual search (AVS) poses significant challenges for autonomous agents in unseen environments with only egocentric RGB-D observations. To address target recognition, semantic understanding, and localization under occlusions and uncertain layouts, we propose a multi-modal feature fusion framework for ground projection. Our method integrates RGB, semantic segmentation, and object detection features into a unified allocentric grid map, leveraging CLIP-based vision-language models and cross-attention mechanisms for semantic alignment. Reliable localization is ensured through a hybrid confidence estimation strategy that combines statistical analysis with learned predictions, enabling uncertainty-aware navigation decisions. Temporal dependencies are modeled via a Transformer-based multi-frame fusion module to enable resilient and coherent map updates in dynamic environments. Furthermore, we introduce a contrastive imitation learning paradigm incorporating adaptive sampling and perturbed trajectory augmentation to improve policy robustness and generalization. Extensive experiments show that our system outperforms baseline methods on visual localization and search tasks.
+    
+Active visual search (AVS) presents substantial challenges for autonomous agents operating in novel environments, particularly when limited to egocentric RGB-D observations. To address the complexities of target recognition, semantic understanding, and localization amid occlusions and uncertain spatial layouts, we introduce a multi-modal feature fusion framework based on ground projection. Our approach unifies RGB, semantic segmentation, and object detection features into an allocentric grid map, employing CLIP-based vision-language models and cross-attention mechanisms to achieve robust semantic alignment. Localization reliability is enhanced by a hybrid confidence estimation strategy that integrates statistical analysis with learned prediction, facilitating uncertainty-aware navigation. Temporal dependencies are captured using a Transformer-based multi-frame fusion module, enabling resilient and consistent map updates in dynamic scenarios. Additionally, we propose a contrastive imitation learning paradigm featuring adaptive sampling and perturbation trajectory augmentation to improve policy robustness and generalization. Comprehensive experiments demonstrate that our framework significantly outperforms existing baselines on visual localization and search tasks. 
   </div>
 </section>
 
@@ -125,6 +126,7 @@
   </footer>
 </body>
 </html>
+
 
 
 
