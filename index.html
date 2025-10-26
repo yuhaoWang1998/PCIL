@@ -127,7 +127,7 @@ Active visual search (AVS) presents substantial challenges for autonomous agents
     <!-- 示例：五个代码文件 -->
     <div class="col-12 col-md-6 mb-4">
       <div class="card">
-        <div class="card-header">train.py</div>
+        <div class="card-header">AEP_module.py</div>
         <div class="card-body" style="max-height:400px; overflow:auto; font-family:monospace; background:#f8f9fa;">
 <pre>
 import torch
@@ -353,17 +353,16 @@ class TemporalTransformer(nn.Module):
       self.output_proj = nn.Linear(d_model, d_model)
 
   def forward(self, x):
-      # 输入x形状: [B, H*W, window_size, d_model]
+
       batch_size, spatial_points, seq_len, d_model = x.shape
 
-      # 重整形状: [B*H*W, seq_len, d_model]
+     
       x = x.view(batch_size * spatial_points, seq_len, d_model)
 
-      # 添加位置编码
+      
       x = x + self.pos_encoding[:seq_len].unsqueeze(0)
 
-      # *** 关键修改：转换为seq_first格式 ***
-      # 从 [B*H*W, seq_len, d_model] 转换为 [seq_len, B*H*W, d_model]
+    
       x = x.transpose(0, 1)
 
       # 通过Transformer (现在输入是 [seq_len, B*H*W, d_model])
@@ -454,7 +453,7 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
         self.frame_buffer = None
         self.buffer_initialized = False
 
-        # 特征提取网络
+       
         if with_feat:
             self.resnet_feat_dim = 256
             fnet = models.resnet50(pretrained=True)
@@ -521,11 +520,11 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
     def get_temporal_features(self, current_frame_idx):
         """获取用于时序融合的特征"""
         if current_frame_idx < self.window_size - 1:
-            # 前几帧：只使用已有的帧
+          
             valid_frames = current_frame_idx + 1
             return self.frame_buffer[:, :, :, :, :valid_frames]
         else:
-            # 达到窗口大小后：使用完整窗口
+           
             return self.frame_buffer
 
     def apply_temporal_fusion(self, features, current_frame_idx):
@@ -545,7 +544,7 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
         # 通过Transformer融合
         fused_features = self.temporal_transformer(temporal_features)
 
-        # 重组回原始形状: [B, H*W, d_model] -> [B, d_model, H, W]
+      
         fused_features = fused_features.view(batch_size, h, w, d_model)
         fused_features = fused_features.permute(0, 3, 1, 2).contiguous()
 
@@ -556,7 +555,7 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
         # 存储原始RGB图像用于CLIP处理
         self.current_rgb_images = img_data.clone()
 
-        # ResNet特征提取
+        
         img_feat = self.ResNet50Truncated(img_data)
         img_feat = F.interpolate(img_feat, size=(self.crop_size[1], self.crop_size[0]), mode='nearest')
 
@@ -570,7 +569,7 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
         return torch.tensor(p0, dtype=torch.float32).cuda()
 
     def forward(self, local_info, update_type, input_flags, p_gt=None):
-        # 为整个剧集运行 MapNet
+        # 为整个episod运行 MapNet
         (img_data, points2D, local3D, sseg, dets) = local_info
         batch_size = img_data.shape[0]
         seq_len = img_data.shape[1]
@@ -598,7 +597,7 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
             batch_size=batch_size,
             seq_len=seq_len,
             input_flags=input_flags,
-            original_img_data=original_img_data  # *** 传递原始图像 ***
+            original_img_data=original_img_data
         )
 
         # 旋转网格的特征通道以获取旋转堆栈
@@ -649,8 +648,6 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
 
         return p_pred, map_pred, confidence_pred
 
-        ## grid：地面网格上的特征表示（通常用于后续地图构建）；map_occ：地面占用图（通常表示哪些区域被占据）
-
     def build_loss(self, p_pred, confidence_pred, p_gt):
         batch_size = p_pred.shape[0]
         seq_len = p_pred.shape[1]
@@ -661,7 +658,7 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
         p_gt = p_gt[:, 1:, :, :, :]
 
         if self.loss_type == "BCE":
-            # 不确定性感知的BCE损失
+            # 不确定性感知的BCE loss
             p_pred_flat = p_pred.contiguous().view(batch_size * (seq_len - 1),
                                                    self.orientations, self.global_map_dim[0], self.global_map_dim[1])
             p_gt_flat = p_gt.contiguous().view(batch_size * (seq_len - 1),
@@ -762,7 +759,7 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
                 confidence_map[i, r, :, :] = torch.sigmoid(confidence)
 
         return p_, confidence_map
-    #在定位阶段用不到forward_single_step
+    
     def forward_single_step(self, local_info, t, input_flags, map_previous=None, p_given=None, update_type="lstm"):
         (img_data, points2D, local3D, sseg, dets) = local_info
         batch_size = img_data.shape[0]
@@ -799,7 +796,7 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
                 sseg=sseg_step,
                 dets=dets_step,
                 input_flags=input_flags,
-                rgb_image=rgb_image  # *** 传递RGB图像 ***
+                rgb_image=rgb_image  
             )
             grid[b, :, :, :] = grid_step.squeeze(0)
 
@@ -836,17 +833,17 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
         """更新地图，支持多帧时序融合"""
 
         if update_type == "lstm" and self.use_temporal_fusion:
-            # 更新帧缓冲区
+     
             self.update_frame_buffer(reg_obsv, batch_size)
 
             # 获取时序特征并应用融合
             temporal_features = self.get_temporal_features(current_frame_idx)
 
             if current_frame_idx >= self.window_size - 1:
-                # 应用时序融合
+                
                 fused_reg_obsv = self.apply_temporal_fusion(temporal_features, current_frame_idx)
             else:
-                # 前几帧使用原始特征
+                
                 fused_reg_obsv = reg_obsv
 
             # 使用融合后的特征进行LSTM更新
@@ -1027,8 +1024,7 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
         # 拼接特征
         grid_out = torch.cat(grids, 1).cuda()
 
-        # *** 移除断言检查，因为现在维度是动态计算的 ***
-       # print(f"最终特征维度: {grid_out.shape}, 期望维度: [1, {self.map_embedding}, H, W]")
+
 
         # 如果维度仍然不匹配，添加一个适配层
         if grid_out.shape[1] != self.map_embedding:
@@ -1100,7 +1096,7 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
         return grid
 
     def groundProjection(self, img_feat_all, points2D_all, local3D_all, sseg_all, dets_all, batch_size, seq_len,
-                         input_flags, original_img_data=None):  # *** 添加原始图像参数 ***
+                         input_flags, original_img_data=None):
         """修正后的批量地面投影"""
         grid = torch.zeros((batch_size, seq_len, self.map_embedding, self.observation_dim[0], self.observation_dim[1]),
                            dtype=torch.float32).cuda()
@@ -1117,7 +1113,7 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
                 sseg_step = sseg_all[b, q, :, :, :].unsqueeze(0)
                 dets_step = dets_all[b, q, :, :, :].unsqueeze(0)
 
-                # *** 关键修正：正确获取RGB图像 ***
+          
                 rgb_image = None
                 if original_img_data is not None:
                     rgb_image = original_img_data[b, q]  # [3, H, W]
@@ -1141,13 +1137,129 @@ class MapNet_transformer_uncertain_clip_1(nn.Module):
     </div>
     <div class="col-12 col-md-6 mb-4">
       <div class="card">
-        <div class="card-header">model.py</div>
+        <div class="card-header">train_AEP.py</div>
         <div class="card-body" style="max-height:400px; overflow:auto; font-family:monospace; background:#f8f9fa;">
 <pre>
-# 这里放你的model.py代码内容
-class Model:
-    # ...
-    pass
+# 代码最后的输出是模型在训练数据上预测的姿态 p_pred 和地图 map_pred
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
+import os
+import numpy as np
+import random
+import data_helper as dh
+import helper as hl
+from MapNet_transformer_uncertain_clip_1 import MapNet_transformer_uncertain_clip_1
+from parameters import ParametersMapNet
+from dataloader import AVD
+from test_MapNet import evaluate_MapNet
+
+
+# 将数据集中一批样本抽取出来，整理成模型需要的格式，并放到GPU上，为后续训练或推理做准备。
+def get_minibatch(par, data, ex_ids, data_index):
+    imgs_batch = torch.zeros(par.batch_size, par.seq_len, 3, par.crop_size[1], par.crop_size[0])
+    pose_gt_batch = np.zeros((par.batch_size, par.seq_len, 3), dtype=np.float32)
+    sseg_batch = torch.zeros(par.batch_size, par.seq_len, 1, par.crop_size[1], par.crop_size[0])
+    dets_batch = torch.zeros(par.batch_size, par.seq_len, par.dets_nClasses, par.crop_size[1], par.crop_size[0])
+    points2D_batch, local3D_batch = [], []
+    for k in range(par.batch_size):
+        ex = data[ex_ids[data_index + k]]
+        imgs_seq = ex["images"]
+        points2D_seq = ex["points2D"]
+        local3D_seq = ex["local3D"]
+        pose_gt_seq = ex["pose"]
+        sseg_seq = ex["sseg"]
+        dets_seq = ex["dets"]
+        imgs_batch[k, :, :, :, :] = imgs_seq
+        pose_gt_batch[k, :, :] = pose_gt_seq
+        sseg_batch[k, :, :, :, :] = sseg_seq
+        dets_batch[k, :, :, :, :] = dets_seq
+        points2D_batch.append(points2D_seq)  # nested list of batch_size x seq_len x n_points x 2
+        local3D_batch.append(local3D_seq)  # nested list of batch_size x seq_len x n_points x 3
+    return (imgs_batch.cuda(), points2D_batch, local3D_batch, pose_gt_batch, sseg_batch.cuda(), dets_batch.cuda())
+
+
+if __name__ == '__main__':
+    par = ParametersMapNet()
+    mapNet_model = MapNet_transformer_uncertain_clip_1(par, update_type=par.update_type, input_flags=par.input_flags)
+    mapNet_model.cuda()
+    print("Model on GPU:", next(mapNet_model.parameters()).is_cuda)
+    mapNet_model.train()
+    optimizer = optim.Adam(mapNet_model.parameters(), lr=par.lr_rate)
+    scheduler = StepLR(optimizer, step_size=par.step_size, gamma=par.gamma)  
+
+    print("Loading the training data...")
+    avd = AVD(par, seq_len=par.seq_len, nEpisodes=par.epi_per_scene,
+              scene_list=par.train_scene_list, action_list=par.action_list, with_shortest_path=par.with_shortest_path)
+
+    log = open(par.model_dir + "train_log_" + par.model_id + ".txt", 'w')
+    hl.save_params(par, par.model_dir, name="mapNet")
+    loss_list = []
+
+    all_ids = list(range(len(avd)))
+    test_ids = all_ids[::100]
+    train_ids = list(set(all_ids) - set(test_ids))
+
+    nData = len(train_ids)
+    iters_per_epoch = int(nData / float(par.batch_size))
+    log.write("Iters_per_epoch:" + str(iters_per_epoch) + "\n")
+    print("Iters per epoch:", iters_per_epoch)
+    for ep in range(par.nEpochs):
+        # 随机打乱训练数据并获取小批量数据进行训练
+        random.shuffle(train_ids)
+        data_index = 0
+        for i in range(iters_per_epoch):
+            iters = i + ep * iters_per_epoch
+
+            # 对训练小批量进行采样
+            batch = get_minibatch(par, data=avd, ex_ids=train_ids, data_index=data_index)
+            (imgs_batch, points2D_batch, local3D_batch, pose_gt_batch, sseg_batch, dets_batch) = batch
+
+            p_gt_batch = dh.build_p_gt(par, pose_gt_batch)
+            data_index += par.batch_size
+
+            # 执行 mapNet 的前向forward
+            local_info = (imgs_batch, points2D_batch, local3D_batch, sseg_batch, dets_batch)
+            p_pred, map_pred, confidence_pred = mapNet_model(local_info, update_type=par.update_type,
+                                                             input_flags=par.input_flags, p_gt=None)
+
+            loss = mapNet_model.build_loss(p_pred, confidence_pred, p_gt_batch)
+            optimizer.zero_grad()
+            loss.backward()
+            total_norm = 0
+            for p in mapNet_model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** (1. / 2)
+
+            if iters % par.show_interval == 0:
+                print(f"Gradient norm: {total_norm}")
+            optimizer.step()
+
+
+
+            if iters % par.show_interval == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                log.write(f"Epoch:{ep} ITER:{iters} Loss:{loss.data.item()} LR:{current_lr}\n")
+                print(f"Epoch: {ep} ITER: {iters} Loss: {loss.data.item()} LR: {current_lr}")
+
+            if iters > 0:
+                loss_list.append(loss.data.item())
+            if iters % par.plot_interval == 0 and iters > 0:
+                hl.plot_loss(loss=loss_list, epoch=ep, iteration=iters, step=1, loss_name="NLL", loss_dir=par.model_dir)
+
+            if iters % par.save_interval == 0:
+                hl.save_model(model=mapNet_model, model_dir=par.model_dir, model_name="MapNet", train_iter=iters)
+
+            if iters % par.test_interval == 0:
+                evaluate_MapNet(par, test_iter=iters, test_ids=test_ids, test_data=avd)
+        scheduler.step()
+
+
+
 </pre>
         </div>
       </div>
@@ -1198,6 +1310,7 @@ class Model:
   </footer>
 </body>
 </html>
+
 
 
 
