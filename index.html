@@ -1475,10 +1475,606 @@ class Encoder(nn.Module):
     <!-- code4.py -->
     <div class="col-12 col-md-6 mb-4">
       <div class="card">
-        <div class="card-header">code4.py</div>
+        <div class="card-header">train_AOS.py</div>
         <div class="card-body" style="max-height:400px; overflow:auto; font-family:monospace; background:#f8f9fa;">
 <pre>
-# 这里放你的第四份代码
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
+import os
+import numpy as np
+import math
+import random
+from dataloader_perturbation_contrast import AVD_IL_Perturbed_Contrast
+from dataloader import AVD_online
+from IL_Net_wo_IPH import ILNet, Encoder
+from mapNet import MapNet
+from parameters_wo_IPH import Parameters_IL, ParametersMapNet
+import helper as hl
+import data_helper as dh
+from itertools import chain
+from test_NavNet import evaluate_NavNet
+import time
+
+print("CUDA is available:", torch.cuda.is_available())
+print("CUDA device count:", torch.cuda.device_count())
+if torch.cuda.is_available():
+    print("Current CUDA device:", torch.cuda.current_device())
+    print("CUDA device name:", torch.cuda.get_device_name(0))
+
+# InfoNCE对比损失函数
+class InfoNCELoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super(InfoNCELoss, self).__init__()
+        self.temperature = temperature
+        self.criterion = nn.CrossEntropyLoss()
+        
+    def forward(self, anchor_features, positive_features, negative_features):
+        """
+        计算InfoNCE损失
+        
+        参数:
+            anchor_features: 锚点特征 [batch_size, feature_dim]
+            positive_features: 正样本特征 [batch_size, feature_dim]
+            negative_features: 负样本特征 [batch_size, neg_count, feature_dim]
+        
+        返回:
+            对比损失值
+        """
+        batch_size = anchor_features.size(0)
+        neg_count = negative_features.size(1)
+        feature_dim = anchor_features.size(1)
+        
+        # 归一化特征向量
+        anchor_features = F.normalize(anchor_features, p=2, dim=1)
+        positive_features = F.normalize(positive_features, p=2, dim=1)
+        negative_features = F.normalize(negative_features.view(-1, feature_dim), p=2, dim=1).view(batch_size, neg_count, feature_dim)
+        
+        # 计算正样本的相似度 [batch_size, 1]
+        pos_similarity = torch.bmm(anchor_features.unsqueeze(1), positive_features.unsqueeze(2)).squeeze(-1)
+        
+        # 计算负样本的相似度 [batch_size, neg_count]
+        neg_similarity = torch.bmm(anchor_features.unsqueeze(1), 
+                                  negative_features.transpose(1, 2)).squeeze(1)
+        
+     
+        logits = torch.cat([pos_similarity, neg_similarity], dim=1) / self.temperature
+        labels = torch.zeros(batch_size, dtype=torch.long).to(anchor_features.device)
+        
+        return self.criterion(logits, labels)
+
+# 从增强数据集中获取小批量数据
+def get_minibatch_with_contrast(batch_size, tvec_dim, seq_len, nActions, data, ex_ids, data_index):
+    # 数据结构与原始相似，但包含原始轨迹和扰动轨迹两部分
+    batch_data = []
+    
+    for k in range(batch_size):
+        batch_data.append(data[ex_ids[data_index + k]])
+    
+    # 处理原始轨迹数据
+    imgs_batch = torch.stack([item['original']['images'] for item in batch_data]).cuda()
+    sseg_batch = torch.stack([item['original']['sseg'] for item in batch_data]).cuda()
+    dets_batch = torch.stack([item['original']['dets'] for item in batch_data]).cuda()
+    imgs_obsv_batch = torch.stack([item['original']['images_obsv'] for item in batch_data]).cuda()
+    dets_obsv_batch = torch.stack([item['original']['dets_obsv'] for item in batch_data]).cuda()
+    
+    # 获取复杂的嵌套数据
+    points2D_batch = [item['original']['points2D'] for item in batch_data]
+    local3D_batch = [item['original']['local3D'] for item in batch_data]
+    
+    # 目标标签
+    tvec_batch = torch.zeros(batch_size, tvec_dim).float().cuda()
+    for k in range(batch_size):
+        tvec_batch[k, batch_data[k]['original']['target_lbl']] = 1
+    
+   
+    pose_gt_batch = np.array([item['original']['pose'] for item in batch_data])
+    collisions_batch = torch.stack([item['original']['collisions'] for item in batch_data]).cuda()
+    actions = [item['original']['actions'] for item in batch_data]
+    costs_batch = torch.stack([item['original']['costs'] for item in batch_data]).cuda()
+    image_names = [item['original']['images_names'] for item in batch_data]
+    scenes = [item['original']['scene'] for item in batch_data]
+    scales = [item['original']['scale'] for item in batch_data]
+    
+    # 处理扰动轨迹数据
+    perturbed_imgs_batch = torch.stack([item['perturbed']['images'] for item in batch_data]).cuda()
+    perturbed_sseg_batch = torch.stack([item['perturbed']['sseg'] for item in batch_data]).cuda()
+    perturbed_dets_batch = torch.stack([item['perturbed']['dets'] for item in batch_data]).cuda()
+    perturbed_imgs_obsv_batch = torch.stack([item['perturbed']['images_obsv'] for item in batch_data]).cuda()
+    perturbed_dets_obsv_batch = torch.stack([item['perturbed']['dets_obsv'] for item in batch_data]).cuda()
+    
+    perturbed_points2D_batch = [item['perturbed']['points2D'] for item in batch_data]
+    perturbed_local3D_batch = [item['perturbed']['local3D'] for item in batch_data]
+    
+    perturbed_pose_gt_batch = np.array([item['perturbed']['pose'] for item in batch_data])
+    perturbed_collisions_batch = torch.stack([item['perturbed']['collisions'] for item in batch_data]).cuda()
+    perturbed_actions = [item['perturbed']['actions'] for item in batch_data]
+    perturbed_costs_batch = torch.stack([item['perturbed']['costs'] for item in batch_data]).cuda()
+    
+    # 对比学习信息
+    contrast_info = {
+        "perturb_points": [item['contrast_info']['perturb_point'] for item in batch_data],
+        "is_positive": [item['contrast_info']['is_positive'] for item in batch_data],
+        "similarity_scores": [item['contrast_info']['similarity_score'] for item in batch_data]
+    }
+    
+    # 返回格式
+    mapNet_batch = (imgs_batch, points2D_batch, local3D_batch, sseg_batch, dets_batch, pose_gt_batch)
+    IL_batch = (imgs_obsv_batch, dets_obsv_batch, tvec_batch, collisions_batch, actions, costs_batch, image_names, scenes, scales)
+    
+    perturbed_mapNet_batch = (perturbed_imgs_batch, perturbed_points2D_batch, perturbed_local3D_batch, 
+                             perturbed_sseg_batch, perturbed_dets_batch, perturbed_pose_gt_batch)
+    perturbed_IL_batch = (perturbed_imgs_obsv_batch, perturbed_dets_obsv_batch, tvec_batch, 
+                         perturbed_collisions_batch, perturbed_actions, perturbed_costs_batch, 
+                         image_names, scenes, scales)
+    
+    return mapNet_batch, IL_batch, perturbed_mapNet_batch, perturbed_IL_batch, contrast_info
+
+def run_mapNet(parMapNet, mapNet, start_info, use_p_gt, pose_gt_batch):
+    if use_p_gt:
+        p_gt_batch = dh.build_p_gt(parMapNet, pose_gt_batch)
+        p_, map_, confidence_ = mapNet(local_info=start_info, update_type=parMapNet.update_type, 
+                                    input_flags=parMapNet.input_flags, p_gt=p_gt_batch)
+        p_ = p_gt_batch.clone() # overwrite the predicted with the ground-truth location
+    else:
+        p_, map_, confidence_ = mapNet(local_info=start_info, update_type=parMapNet.update_type, input_flags=parMapNet.input_flags)
+    return p_, map_
+
+def extract_state_features(parIL, state, policy_net):
+    """从策略网络提取状态特征，用于对比学习"""
+    # 根据状态包含的元素初始化隐藏状态
+    policy_net.hidden = policy_net.init_hidden(batch_size=state[0].size(0), state_items=len(state)-1)
+    
+    # 使用前向传播但不返回预测的成本，而是返回内部特征
+    with torch.no_grad():
+        state_features = policy_net.get_features(state, parIL.use_ego_obsv)
+        
+    return state_features
+
+def select_minibatch(par, iters_done):
+    sample = random.random()
+    eps_threshold = par.EPS_END + (par.EPS_START-par.EPS_END) * math.exp(-1. * iters_done / par.EPS_DECAY)
+    if sample > eps_threshold:
+        return 0
+    else:
+        return 1
+
+def unroll_policy(parIL, parMapNet, policy_net, mapNet, action_list, batch_size, seq_len, graphs):
+    with torch.no_grad():
+        nScenes = 4
+        ind = np.random.randint(len(parIL.train_scene_list), size=nScenes)
+        scene_list = np.asarray(parIL.train_scene_list)
+        sel_scene = scene_list[ind]
+        avd_dagger = AVD_online(par=parIL, nStartPos=batch_size/nScenes, 
+                                        scene_list=sel_scene, action_list=action_list, graphs_dict=graphs)
+        
+        # 初始化所有要返回的数组
+        imgs_batch = torch.zeros(batch_size, seq_len, 3, avd_dagger.cropSize[1], avd_dagger.cropSize[0]).float().cuda()
+        sseg_batch = torch.zeros(batch_size, seq_len, 1, avd_dagger.cropSize[1], avd_dagger.cropSize[0]).float().cuda()
+        dets_batch = torch.zeros(batch_size, seq_len, avd_dagger.dets_nClasses, avd_dagger.cropSize[1], avd_dagger.cropSize[0]).float().cuda()
+        imgs_obsv_batch = torch.zeros(batch_size, seq_len, 3, avd_dagger.cropSizeObsv[1], avd_dagger.cropSizeObsv[0]).float().cuda()
+        dets_obsv_batch = torch.zeros(batch_size, seq_len, 1, avd_dagger.cropSizeObsv[1], avd_dagger.cropSizeObsv[0]).float().cuda()
+        tvec_batch = torch.zeros(batch_size, parIL.nTargets).float().cuda()
+        pose_gt_batch = np.zeros((batch_size, seq_len, 3), dtype=np.float32)
+        collisions_batch = torch.zeros(batch_size, seq_len).float().cuda()
+        costs_batch = torch.zeros(batch_size, seq_len, len(action_list)).float().cuda()
+        points2D_batch, local3D_batch = [], []
+        image_names_batch, scene_batch, scale_batch, actions = [], [], [], []
+        
+        for i in range(len(avd_dagger)):
+            ex = avd_dagger[i]
+            img = ex["image"].unsqueeze(0)
+            points2D_seq, local3D_seq = [], [] 
+            points2D_seq.append(ex["points2D"])
+            local3D_seq.append(ex["local3D"])
+            sseg = ex["sseg"].unsqueeze(0)
+            dets = ex['dets'].unsqueeze(0)
+            mapNet_input_start = (img.cuda(), points2D_seq, local3D_seq, sseg.cuda(), dets.cuda())
+            
+            target_lbl = ex["target_lbl"]
+            im_obsv = ex['image_obsv'].cuda()
+            dets_obsv = ex['dets_obsv'].cuda()
+            tvec = torch.zeros(1, parIL.nTargets).float().cuda()
+            tvec[0,target_lbl] = 1
+            image_name_seq = []
+            image_name_seq.append(ex['image_name'])
+            scene = ex['scene']
+            scene_batch.append(scene)
+            scale = ex['scale']
+            scale_batch.append(scale)
+            graph = avd_dagger.graphs_dict[target_lbl][scene]
+            abs_pose_seq = np.zeros((seq_len, 3), dtype=np.float32)
+
+            annotations, _, im_names_all, world_poses, directions = dh.load_scene_info(parIL.avd_root, scene)
+            start_abs_pose = dh.get_image_poses(world_poses, directions, im_names_all, image_name_seq, scale)
+            
+            p_, confidence_, map_ = mapNet.forward_single_step(local_info=mapNet_input_start, t=0, 
+                                                    input_flags=parMapNet.input_flags, update_type=parMapNet.update_type)
+            collision_ = torch.tensor([0], dtype=torch.float32).cuda()
+            if parIL.use_ego_obsv:
+                enc_in = torch.cat((im_obsv, dets_obsv), 0).unsqueeze(0)
+                ego_obsv_feat = ego_encoder(enc_in)
+                state = (map_, p_, tvec, collision_, ego_obsv_feat)
+            else:
+                state = (map_, p_, tvec, collision_) 
+            current_im = image_name_seq[0]
+
+            imgs_batch[i,0,:,:,:] = img
+            sseg_batch[i,0,:,:,:] = sseg
+            dets_batch[i,0,:,:,:] = dets
+            imgs_obsv_batch[i,0,:,:,:] = im_obsv
+            dets_obsv_batch[i,0,:,:,:] = dets_obsv
+            tvec_batch[i] = tvec
+            collisions_batch[i,0] = collision_
+            abs_pose_seq[0,:] = start_abs_pose
+            cost = np.asarray(dh.get_state_action_cost(current_im, action_list, annotations, graph), dtype=np.float32)
+            costs_batch[i,0,:] = torch.from_numpy(cost).float()
+
+            policy_net.hidden = policy_net.init_hidden(batch_size=1, state_items=len(state)-1)
+            for t in range(1, seq_len):
+                pred_costs = policy_net(state, parIL.use_ego_obsv)
+                pred_costs = pred_costs.view(-1).cpu().numpy()
+                pred_label = np.argmin(pred_costs)
+                pred_action = action_list[pred_label]
+                actions.append(pred_action)
+
+                next_im = avd_dagger.scene_annotations[scene][current_im][pred_action]
+                if not(next_im==''):
+                    collision = 0
+                    batch_next, obsv_batch_next = avd_dagger.get_step_data(next_ims=[next_im], scenes=[scene], scales=[scale])
+                    next_im_abs_pose = dh.get_image_poses(world_poses, directions, im_names_all, [next_im], scale)
+                    if parIL.use_p_gt:
+                        abs_poses = np.concatenate((start_abs_pose, next_im_abs_pose), axis=0)
+                        rel_poses = dh.relative_poses(poses=abs_poses)
+                        next_im_rel_pose = np.expand_dims(rel_poses[1,:], axis=0)
+                        p_gt = dh.build_p_gt(parMapNet, pose_gt_batch=np.expand_dims(next_im_rel_pose, axis=1)).squeeze(1)
+                        p_next,  confidence_next, map_next = mapNet.forward_single_step(local_info=batch_next, t=t, input_flags=parMapNet.input_flags,
+                                                                map_previous=state[0], p_given=p_gt, update_type=parMapNet.update_type)
+                    else:
+                        p_next, confidence_next, map_next = mapNet.forward_single_step(local_info=batch_next, t=t, 
+                                            input_flags=parMapNet.input_flags, map_previous=state[0], update_type=parMapNet.update_type)
+                    if parIL.use_ego_obsv:
+                        enc_in = torch.cat(obsv_batch_next, 1)
+                        ego_obsv_feat = ego_encoder(enc_in)
+                        state = (map_next, p_next, tvec, torch.tensor([collision], dtype=torch.float32).cuda(), ego_obsv_feat)
+                    else:
+                        state = (map_next, p_next, tvec, torch.tensor([collision], dtype=torch.float32).cuda())
+                    current_im = next_im
+                    
+                    (imgs_next, points2D_next, local3D_next, sseg_next, dets_next) = batch_next
+                    (imgs_obsv_next, dets_obsv_next) = obsv_batch_next
+                    imgs_batch[i,t,:,:,:] = imgs_next
+                    sseg_batch[i,t,:,:,:] = sseg_next
+                    dets_batch[i,t,:,:,:] = dets_next
+                    imgs_obsv_batch[i,t,:,:,:] = imgs_obsv_next
+                    dets_obsv_batch[i,t,:,:,:] = dets_obsv_next
+                    collisions_batch[i,t] = torch.tensor([collision], dtype=torch.float32)
+                    abs_pose_seq[t,:] = next_im_abs_pose
+                    cost = np.asarray(dh.get_state_action_cost(current_im, action_list, annotations, graph), dtype=np.float32)
+                    costs_batch[i,t,:] = torch.from_numpy(cost).float()
+                    image_name_seq.append(current_im)
+                    points2D_seq.append(points2D_next[0])
+                    local3D_seq.append(local3D_next[0])
+
+                else:
+                    collision = 1
+                    if parIL.stop_on_collision:
+                        break
+                    if parIL.use_ego_obsv:
+                        state = (state[0], state[1], state[2], torch.tensor([collision], dtype=torch.float32).cuda(), state[4])
+                    else:
+                        state = (state[0], state[1], state[2], torch.tensor([collision], dtype=torch.float32).cuda())
+                    
+                    imgs_batch[i,t,:,:,:] = imgs_batch[i,t-1,:,:,:]
+                    sseg_batch[i,t,:,:,:] = sseg_batch[i,t-1,:,:,:]
+                    dets_batch[i,t,:,:,:] = dets_batch[i,t-1,:,:,:]
+                    imgs_obsv_batch[i,t,:,:,:] = imgs_obsv_batch[i,t-1,:,:,:]
+                    dets_obsv_batch[i,t,:,:,:] = dets_obsv_batch[i,t-1,:,:,:]
+                    collisions_batch[i,t] = torch.tensor([collision], dtype=torch.float32)
+                    abs_pose_seq[t,:] = abs_pose_seq[t-1,:]
+                    costs_batch[i,t,:] = costs_batch[i,t-1,:]
+                    image_name_seq.append(current_im)
+                    points2D_seq.append(points2D_seq[t-1])
+                    local3D_seq.append(local3D_seq[t-1])
+
+            pose_gt_batch[i] = dh.relative_poses(poses=abs_pose_seq)
+            image_names_batch.append(image_name_seq)
+            points2D_batch.append(points2D_seq)
+            local3D_batch.append(local3D_seq)
+
+        actions = np.asarray(actions)
+        image_names_batch = np.asarray(image_names_batch)
+
+        mapNet_batch = (imgs_batch, points2D_batch, local3D_batch, sseg_batch, dets_batch, pose_gt_batch)
+        IL_batch = (imgs_obsv_batch, dets_obsv_batch, tvec_batch, collisions_batch, actions, costs_batch, image_names_batch, scene_batch, scale_batch)
+        return mapNet_batch, IL_batch
+
+if __name__ == '__main__':
+    # 配置参数
+    parMapNet = ParametersMapNet()
+    parIL = Parameters_IL()
+    parIL.model_id = "IL_perturb_contrast"  # 设置新的模型ID
+    parIL.model_dir = os.path.join(os.path.dirname(parIL.model_dir), f"{parIL.model_id}/")
+    os.makedirs(parIL.model_dir, exist_ok=True)
+    
+    # 对比学习超参数
+    contrast_weight = 0.1  # 对比损失的权重
+    temperature = 0.07     # InfoNCE温度参数
+    negative_samples = 32  # 从小批量中选择的负样本数量
+    
+    action_list = np.asarray(parMapNet.action_list)
+
+    # 初始化模型
+    policy_net = ILNet(parIL, parMapNet.map_embedding, parMapNet.orientations, parIL.nTargets, len(action_list), parIL.use_ego_obsv)
+    policy_net.train()
+    policy_net.cuda()
+
+    # 加载预训练的MapNet模型
+    state_model = hl.load_model(model_dir=parIL.mapNet_model_dir, model_name="MapNet",
+                                test_iter=parIL.mapNet_iters, eval=not(parIL.finetune_mapNet))
+    
+    # 初始化优化器
+    if parIL.finetune_mapNet:
+        all_params = chain(policy_net.parameters(), state_model.parameters())
+    else:
+        all_params = policy_net.parameters()
+    optimizer = optim.Adam(all_params, lr=parIL.lr_rate)
+    scheduler = StepLR(optimizer, step_size=parIL.step_size, gamma=parIL.gamma)
+    
+    # 初始化InfoNCE损失
+    contrast_criterion = InfoNCELoss(temperature=temperature)
+
+    # 加载ego观察编码器（如果使用）
+    if parIL.use_ego_obsv:
+        ego_encoder = Encoder()
+        ego_encoder.cuda()
+        ego_encoder.eval()
+    else:
+        ego_encoder = None
+
+    # 加载扰动对比学习的数据集
+    print("Loading training episodes with perturbation and contrast...")
+    img_encoder_path = os.path.join(os.path.dirname(os.path.dirname(parIL.model_dir)), 
+                                   "Img_encoder.pth.tar")
+    avd = AVD_IL_Perturbed_Contrast(
+        par=parIL, 
+        seq_len=parIL.seq_len, 
+        nEpisodes=parIL.epi_per_scene,
+        scene_list=parIL.train_scene_list, 
+        action_list=action_list,
+        perturb_prob=0.6,  # 60%的轨迹应用扰动
+        similarity_threshold=0.6,
+        img_encoder_path=img_encoder_path
+    )
+
+    # 加载验证数据集
+    print("Loading validation episodes...")
+    avd_test = AVD_online(par=parIL, nStartPos=10, scene_list=parIL.train_scene_list, action_list=action_list)
+    
+    test_ids = list(range(len(avd_test)))
+    train_ids = list(range(len(avd)))
+    
+    # 保存参数和初始化日志
+    hl.save_params(parIL, parIL.model_dir, name="IL")
+    hl.save_params(parMapNet, parIL.model_dir, name="mapNet")
+    log = open(parIL.model_dir + f"train_log_{parIL.model_id}.txt", 'w')
+    
+    nData = len(train_ids)
+    iters_per_epoch = int(nData / float(parIL.batch_size))
+    log.write(f"Iters_per_epoch: {iters_per_epoch}\n")
+    print(f"Iters per epoch: {iters_per_epoch}")
+    
+    loss_list = []
+    contrast_loss_list = []
+
+    # 开始训练循环
+    for ep in range(parIL.nEpochs):
+        epoch_start_time = time.time()
+        random.shuffle(train_ids)
+        data_index = 0
+        
+        for i in range(iters_per_epoch):
+            iters = i + ep * iters_per_epoch
+            
+            # 选择数据源：预采样数据或在线生成数据
+            ch = select_minibatch(par=parIL, iters_done=iters)
+            
+            if ch:
+                # 使用预处理的对比学习数据
+                mapNet_batch, IL_batch, perturbed_mapNet_batch, perturbed_IL_batch, contrast_info = get_minibatch_with_contrast(
+                    batch_size=parIL.batch_size,
+                    tvec_dim=parIL.nTargets,
+                    seq_len=parIL.seq_len,
+                    nActions=len(action_list),
+                    data=avd,
+                    ex_ids=train_ids,
+                    data_index=data_index
+                )
+                
+                # 计算对比学习损失的标志
+                use_contrast_loss = True
+                
+            else:
+                # 使用在线生成的数据
+                mapNet_batch, IL_batch = unroll_policy(parIL, parMapNet, policy_net, state_model,
+                                                    action_list, batch_size=parIL.batch_size, 
+                                                    seq_len=parIL.seq_len, graphs=avd.graphs_dict)
+                
+                # 在线数据不包含扰动和对比信息
+                perturbed_mapNet_batch = None
+                perturbed_IL_batch = None
+                contrast_info = None
+                use_contrast_loss = False
+            
+            data_index += parIL.batch_size
+            
+         
+            (imgs_batch, points2D_batch, local3D_batch, sseg_batch, dets_batch, pose_gt_batch) = mapNet_batch
+            (imgs_obsv_batch, dets_obsv_batch, tvec_batch, collisions_batch, actions, costs_batch, 
+             image_names, scenes, scales) = IL_batch
+            
+            # 1. 处理原始轨迹
+            start_info = (imgs_batch, points2D_batch, local3D_batch, sseg_batch, dets_batch)
+            if parIL.finetune_mapNet:
+                p_, map_ = run_mapNet(parMapNet, state_model, start_info, parIL.use_p_gt, pose_gt_batch)
+            else:
+                with torch.no_grad():
+                    p_, map_ = run_mapNet(parMapNet, state_model, start_info, parIL.use_p_gt, pose_gt_batch)
+            
+            if parIL.use_ego_obsv:
+                with torch.no_grad():
+                    enc_in = torch.cat((imgs_obsv_batch, dets_obsv_batch), 2)
+                    enc_in = enc_in.view(parIL.batch_size*parIL.seq_len, 4, parIL.crop_size_obsv[1], parIL.crop_size_obsv[0])
+                    ego_obsv_feat = ego_encoder(enc_in)
+                    ego_obsv_feat = ego_obsv_feat.view(parIL.batch_size, parIL.seq_len, ego_obsv_feat.shape[1])
+                state = (map_, p_, tvec_batch, collisions_batch, ego_obsv_feat)
+            else: 
+                state = (map_, p_, tvec_batch, collisions_batch)
+            
+            # 计算主要的导航损失
+            policy_net.hidden = policy_net.init_hidden(parIL.batch_size, state_items=len(state)-1)
+            pred_costs = policy_net(state, parIL.use_ego_obsv)
+            nav_loss = policy_net.build_loss(cost_pred=pred_costs, cost_gt=costs_batch, loss_weight=parIL.loss_weight)
+            
+            # 初始化总损失
+            total_loss = nav_loss
+            contrast_loss = torch.tensor(0.0).cuda()
+            perturbed_nav_loss = torch.tensor(0.0).cuda()
+            
+            # 2. 如果使用对比学习数据，计算额外的损失
+            if use_contrast_loss and perturbed_mapNet_batch is not None:
+                # 解包扰动数据
+                (perturbed_imgs_batch, perturbed_points2D_batch, perturbed_local3D_batch, 
+                 perturbed_sseg_batch, perturbed_dets_batch, perturbed_pose_gt_batch) = perturbed_mapNet_batch
+                (perturbed_imgs_obsv_batch, perturbed_dets_obsv_batch, _, perturbed_collisions_batch, 
+                 perturbed_actions, perturbed_costs_batch, _, _, _) = perturbed_IL_batch
+                
+                # 处理扰动轨迹
+                perturbed_start_info = (perturbed_imgs_batch, perturbed_points2D_batch, perturbed_local3D_batch, 
+                                       perturbed_sseg_batch, perturbed_dets_batch)
+                if parIL.finetune_mapNet:
+                    perturbed_p_, perturbed_map_ = run_mapNet(parMapNet, state_model, perturbed_start_info, 
+                                                            parIL.use_p_gt, perturbed_pose_gt_batch)
+                else:
+                    with torch.no_grad():
+                        perturbed_p_, perturbed_map_ = run_mapNet(parMapNet, state_model, perturbed_start_info, 
+                                                                 parIL.use_p_gt, perturbed_pose_gt_batch)
+                
+                if parIL.use_ego_obsv:
+                    with torch.no_grad():
+                        perturbed_enc_in = torch.cat((perturbed_imgs_obsv_batch, perturbed_dets_obsv_batch), 2)
+                        perturbed_enc_in = perturbed_enc_in.view(parIL.batch_size*parIL.seq_len, 4, 
+                                                               parIL.crop_size_obsv[1], parIL.crop_size_obsv[0])
+                        perturbed_ego_obsv_feat = ego_encoder(perturbed_enc_in)
+                        perturbed_ego_obsv_feat = perturbed_ego_obsv_feat.view(parIL.batch_size, parIL.seq_len, 
+                                                                        perturbed_ego_obsv_feat.shape[1])
+                    perturbed_state = (perturbed_map_, perturbed_p_, tvec_batch, perturbed_collisions_batch, perturbed_ego_obsv_feat)
+                else: 
+                    perturbed_state = (perturbed_map_, perturbed_p_, tvec_batch, perturbed_collisions_batch)
+                
+                # 计算对比学习损失
+                orig_features = extract_state_features(parIL, state, policy_net)
+                perturbed_features = extract_state_features(parIL, perturbed_state, policy_net)
+                
+                valid_contrast_samples = 0
+                for b in range(parIL.batch_size):
+                    perturb_point = contrast_info['perturb_points'][b]
+                    
+                    if perturb_point > 0:
+                        anchor_feat = orig_features[b, perturb_point+1].unsqueeze(0)
+                        contrast_feat = perturbed_features[b, perturb_point+1].unsqueeze(0)
+                        is_positive = contrast_info['is_positive'][b]
+                        
+                        neg_indices = [j for j in range(parIL.batch_size) if j != b]
+                        if len(neg_indices) > negative_samples:
+                            neg_indices = random.sample(neg_indices, negative_samples)
+                        
+                        if is_positive:
+                            neg_feats = torch.stack([perturbed_features[j, perturb_point+1] for j in neg_indices])
+                            pos_contrast_loss = contrast_criterion(anchor_feat, contrast_feat, neg_feats.unsqueeze(0))
+                            contrast_loss += pos_contrast_loss
+                        else:
+                            if neg_indices:
+                                pos_idx = random.choice(neg_indices)
+                                pos_feat = orig_features[pos_idx, perturb_point+1].unsqueeze(0)
+                                
+                                all_neg_indices = neg_indices.copy()
+                                if pos_idx in all_neg_indices:
+                                    all_neg_indices.remove(pos_idx)
+                                if len(all_neg_indices) > 0:
+                                    other_neg_feats = torch.stack([perturbed_features[j, perturb_point+1] for j in all_neg_indices])
+                                    neg_feats = torch.cat([contrast_feat, other_neg_feats], dim=0)
+                                    
+                                    neg_contrast_loss = contrast_criterion(anchor_feat, pos_feat, neg_feats.unsqueeze(0))
+                                    contrast_loss += neg_contrast_loss
+                                    valid_contrast_samples += 1
+                
+                if valid_contrast_samples > 0:
+                    contrast_loss = contrast_loss / valid_contrast_samples
+                
+                # 计算扰动轨迹的导航损失
+                policy_net.hidden = policy_net.init_hidden(parIL.batch_size, state_items=len(perturbed_state)-1)
+                perturbed_pred_costs = policy_net(perturbed_state, parIL.use_ego_obsv)
+                perturbed_nav_loss = policy_net.build_loss(
+                    cost_pred=perturbed_pred_costs, 
+                    cost_gt=perturbed_costs_batch, 
+                    loss_weight=parIL.loss_weight
+                )
+                
+                # 更新总损失
+                total_loss = nav_loss + perturbed_nav_loss + contrast_weight * contrast_loss
+            
+           
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+            
+            # 输出、记录和可视化
+            if iters % parIL.show_interval == 0:
+                if use_contrast_loss:
+                    log_msg = (f"Epoch: {ep} ITER: {iters} "
+                              f"Nav_Loss: {nav_loss.item():.4f} "
+                              f"Perturb_Loss: {perturbed_nav_loss.item():.4f} "
+                              f"Contrast_Loss: {contrast_loss.item():.4f} "
+                              f"Total_Loss: {total_loss.item():.4f} [Contrast]")
+                else:
+                    log_msg = (f"Epoch: {ep} ITER: {iters} "
+                              f"Nav_Loss: {nav_loss.item():.4f} "
+                              f"Total_Loss: {total_loss.item():.4f} [Online]")
+                log.write(log_msg + "\n")
+                print(log_msg)
+                log.flush()
+            
+            if iters > 0:
+                loss_list.append(total_loss.item())
+                contrast_loss_list.append(contrast_loss.item())
+                
+            if iters % parIL.plot_interval == 0 and iters > 0:
+                hl.plot_loss(loss=loss_list, epoch=ep, iteration=iters, 
+                            step=1, loss_name="Total_Loss", loss_dir=parIL.model_dir)
+                hl.plot_loss(loss=contrast_loss_list, epoch=ep, iteration=iters,
+                            step=1, loss_name="Contrast_Loss", loss_dir=parIL.model_dir)
+                
+            if iters % parIL.save_interval == 0:
+                hl.save_model(model=policy_net, model_dir=parIL.model_dir, 
+                             model_name="ILNet", train_iter=iters)
+                if parIL.finetune_mapNet:
+                    hl.save_model(model=state_model, model_dir=parIL.model_dir, 
+                                model_name="MapNet", train_iter=iters)
+            
+            if iters % parIL.test_interval == 0:
+                evaluate_NavNet(parIL, parMapNet, mapNet=state_model, ego_encoder=ego_encoder, 
+                               test_iter=iters, test_ids=test_ids, test_data=avd_test, 
+                               action_list=action_list)
+        
+        
+        epoch_time = time.time() - epoch_start_time
+        print(f"Epoch {ep} completed in {epoch_time:.2f} seconds. Updating learning rate...")
+        scheduler.step()
+
+    
 </pre>
         </div>
       </div>
@@ -1506,6 +2102,7 @@ class Encoder(nn.Module):
   </footer>
 </body>
 </html>
+
 
 
 
