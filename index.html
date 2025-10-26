@@ -117,13 +117,1078 @@ Active visual search (AVS) presents substantial challenges for autonomous agents
       </div>
     </div>
   </section>
-  <!-- Code -->
-  <section id="code" class="container my-5">
-    <h2 class="text-center">Code</h2>
-    <div class="mt-3 text-center" style="font-size:1.1em;">
-      We have released the training and model code for peer review.
+<!-- Code -->
+<section id="code" class="container my-5">
+  <h2 class="text-center">Code</h2>
+  <div class="mt-3 text-center" style="font-size:1.1em;">
+    We release the training and model code for peer review.
+  </div>
+  <div class="row mt-4 justify-content-center">
+    <!-- 示例：五个代码文件 -->
+    <div class="col-12 col-md-6 mb-4">
+      <div class="card">
+        <div class="card-header">train.py</div>
+        <div class="card-body" style="max-height:400px; overflow:auto; font-family:monospace; background:#f8f9fa;">
+<pre>
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models
+import os
+import numpy as np
+import data_helper as dh
+import clip
+
+class CLIPFeatureExtractor(nn.Module):
+    def __init__(self, clip_model="ViT-B/32", device="cuda"):
+        super().__init__()
+
+        
+        if isinstance(device, int):
+            self.device = f"cuda:{device}"
+        elif isinstance(device, str):
+            if device.isdigit():
+                self.device = f"cuda:{device}"
+            else:
+                self.device = device
+        else:
+            self.device = device
+
+        # 加载CLIP模型
+        self.model, self.preprocess = clip.load(clip_model, device=self.device)
+
+        
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        
+        self.object_categories = ['dining_table', 'fridge', 'tv', 'couch', 'microwave']
+
+        
+        self.text_features = self._encode_text_features()
+        self.similarity_threshold = 0.3
+
+    def _encode_text_features(self):
+        """预计算所有类别的文本特征"""
+        text_inputs = torch.cat([clip.tokenize(f"a photo of a {c}") for c in self.object_categories]).to(self.device)
+        with torch.no_grad():
+            text_features = self.model.encode_text(text_inputs)
+        return text_features / text_features.norm(dim=-1, keepdim=True)
+
+    def preprocess_images(self, images):
+        """预处理图像以匹配CLIP输入要求"""
+        images = images.to(self.device)
+
+       
+        if len(images.shape) == 5:  # [B, T, C, H, W]
+            B, T, C, H, W = images.shape
+            images = images.view(B * T, C, H, W)
+        elif len(images.shape) == 4:  # [B, C, H, W]
+            B, C, H, W = images.shape
+            T = 1
+        else:
+            raise ValueError(f"Unexpected image shape: {images.shape}")
+
+        
+        if H != 224 or W != 224:
+            images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+
+        # 确保数值范围在[0,1]
+        if images.max() > 1.0:
+            images = images / 255.0
+
+        # CLIP标准化
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=self.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=self.device).view(1, 3, 1, 1)
+        images_normalized = (images - mean) / std
+
+        return images_normalized
+
+    def encode_images(self, images):
+        """编码图像特征"""
+        model_device = next(self.model.parameters()).device
+        images = images.to(model_device)
+
+        
+        original_shape = images.shape
+        if len(original_shape) == 5:  # [B, T, C, H, W]
+            B, T = original_shape[:2]
+            images = images.view(B * T, *original_shape[2:])
+        elif len(original_shape) == 4:  # [B, C, H, W]
+            B, T = original_shape[0], 1
+        else:
+            raise ValueError(f"Unexpected image shape: {original_shape}")
+
+        
+        images_processed = self.preprocess_images(images)
+        expected_dtype = getattr(self.model, 'dtype', torch.float32)
+        images_processed = images_processed.to(dtype=expected_dtype)
+
+        try:
+            with torch.no_grad():
+                image_features = self.model.encode_image(images_processed)
+        except RuntimeError as e:
+            print(f"Error during CLIP encoding: {e}")
+            raise e
+
+       
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        
+        if len(original_shape) == 5:
+            feature_dim = image_features.shape[-1]
+            image_features = image_features.view(B, T, feature_dim)
+
+        return image_features
+
+    def get_relevant_objects(self, images):
+        """获取相关物品的特征和掩码"""
+        images = images.to(self.device)
+        image_features = self.encode_images(images)
+
+        # 计算相似度
+        if len(image_features.shape) == 3:  # [B, T, feature_dim]
+            B, T, feature_dim = image_features.shape
+            image_features_flat = image_features.view(B * T, feature_dim)
+        else:  # [B, feature_dim]
+            B, feature_dim = image_features.shape
+            T = 1
+            image_features_flat = image_features
+
+        similarities = 100.0 * image_features_flat @ self.text_features.T
+
+        if T > 1:
+            similarities = similarities.view(B, T, -1)
+
+        relevance_mask = similarities > self.similarity_threshold
+
+        return {
+            'image_features': image_features,
+            'text_features': self.text_features,
+            'similarities': similarities,
+            'relevance_mask': relevance_mask,
+            'categories': self.object_categories
+        }
+
+
+class ObjectAttentionLayer(nn.Module):
+    def __init__(self, d_model, nhead=4, dropout=0.1):
+        super().__init__()
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        # FFN
+        self.linear1 = nn.Linear(d_model, d_model * 4)
+        self.dropout1 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_model * 4, d_model)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.activation = F.relu
+
+    def forward_ffn(self, tgt):
+        tgt2 = self.linear2(self.dropout1(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+        return tgt
+
+    def forward(self, map_features, object_features, relevance_mask=None):
+   
+        B, H_W, d_model = map_features.shape
+        _, num_obj, _ = object_features.shape
+
+       
+        q = map_features.permute(1, 0, 2)  # [H*W, B, d]
+        k = object_features.permute(1, 0, 2)  # [num_obj, B, d]
+        v = object_features.permute(1, 0, 2)  # [num_obj, B, d]
+
+        
+        key_padding_mask = None
+        if relevance_mask is not None:
+            key_padding_mask = ~relevance_mask
+
+        
+        map_features2, _ = self.multihead_attn(
+            query=q,
+            key=k,
+            value=v,
+            key_padding_mask=key_padding_mask
+        )
+
+      
+        map_features2 = map_features2.permute(1, 0, 2)  # [B, H*W, d]
+        map_features = map_features + self.dropout(map_features2)
+        map_features = self.norm(map_features)
+
+        
+        map_features = self.forward_ffn(map_features)
+
+        return map_features
+
+
+
+class TemporalTransformer(nn.Module):
+  def __init__(self, d_model, num_heads, num_layers, window_size):
+      super(TemporalTransformer, self).__init__()
+      self.d_model = d_model
+      self.window_size = window_size
+
+     
+      self.pos_encoding = nn.Parameter(torch.randn(window_size, d_model))
+
+      
+      encoder_layer = nn.TransformerEncoderLayer(
+          d_model=d_model,
+          nhead=num_heads,
+          dim_feedforward=4 * d_model,
+          dropout=0.1
+
+      )
+      self.transformer_encoder = nn.TransformerEncoder(
+          encoder_layer,
+          num_layers=num_layers
+      )
+
+      
+      self.output_proj = nn.Linear(d_model, d_model)
+
+  def forward(self, x):
+      # 输入x形状: [B, H*W, window_size, d_model]
+      batch_size, spatial_points, seq_len, d_model = x.shape
+
+      # 重整形状: [B*H*W, seq_len, d_model]
+      x = x.view(batch_size * spatial_points, seq_len, d_model)
+
+      # 添加位置编码
+      x = x + self.pos_encoding[:seq_len].unsqueeze(0)
+
+      # *** 关键修改：转换为seq_first格式 ***
+      # 从 [B*H*W, seq_len, d_model] 转换为 [seq_len, B*H*W, d_model]
+      x = x.transpose(0, 1)
+
+      # 通过Transformer (现在输入是 [seq_len, B*H*W, d_model])
+      output = self.transformer_encoder(x)  # 输出: [seq_len, B*H*W, d_model]
+
+      # 取最后一个时间步的输出作为融合结果
+      fused_output = output[-1, :, :]  # [B*H*W, d_model]
+
+      # 应用输出投影
+      fused_output = self.output_proj(fused_output)
+
+      # 恢复空间维度: [B*H*W, d_model] -> [B, H*W, d_model]
+      fused_output = fused_output.view(batch_size, spatial_points, d_model)
+
+      return fused_output
+
+
+class MapNet_transformer_uncertain_clip_1(nn.Module):
+    def __init__(self, par, update_type, input_flags):
+        super(MapNet_transformer_uncertain_clip_1, self).__init__()
+        (with_feat, with_sseg, with_dets, use_raw_sseg, use_raw_dets) = input_flags
+
+        self.crop_size = par.crop_size
+        self.global_map_dim = par.global_map_dim
+        self.observation_dim = par.observation_dim
+        self.cell_size = par.cell_size
+        self.sseg_labels = par.sseg_labels
+        self.dets_nClasses = par.dets_nClasses
+        self.orientations = par.orientations
+        self.pad = par.pad
+        self.loss_type = par.loss_type
+        self.update_type = par.update_type
+        self.window_size = getattr(par, 'window_size', 4)
+        self.use_temporal_fusion = getattr(par, 'use_temporal_fusion', True)
+
+
+        self.img_embedding = 64  # CLIP增强后的图像特征维度
+        self.sseg_embedding = getattr(par, 'sseg_embedding', 16)
+        self.dets_embedding = getattr(par, 'dets_embedding', 16)
+
+
+        actual_embedding = 0
+        if with_feat:
+            actual_embedding += self.img_embedding
+        if with_sseg:
+            actual_embedding += self.sseg_embedding
+        if with_dets:
+            actual_embedding += self.dets_embedding
+
+        
+        self.map_embedding = actual_embedding
+        print(f"动态计算的 map_embedding: {self.map_embedding}")
+
+        # 如果原始参数设置了 map_embedding，给出警告
+        if hasattr(par, 'map_embedding') and par.map_embedding != actual_embedding:
+            print(
+                f"警告: 参数中的 map_embedding ({par.map_embedding}) 与实际计算值 ({actual_embedding}) 不匹配，使用实际计算值")
+        
+    
+        par.map_embedding = actual_embedding
+
+
+        self.clip_extractor = CLIPFeatureExtractor(device="cuda")
+        self.object_attn = ObjectAttentionLayer(d_model=self.img_embedding, nhead=4)  # 注意这里用img_embedding
+        self.clip_proj = nn.Linear(512, self.img_embedding)  # CLIP特征投影到图像特征维度
+        self.current_rgb_images = None
+
+        # 置信度分支
+        self.confidence_branch = nn.Sequential(
+            nn.Conv2d(self.map_embedding, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, self.orientations, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+        # 时序Transformer
+        if self.use_temporal_fusion and update_type == "lstm":
+            self.temporal_transformer = TemporalTransformer(
+                d_model=self.map_embedding,
+                num_heads=4,
+                num_layers=2,
+                window_size=self.window_size
+            )
+
+        # 历史帧缓冲区初始化标志
+        self.frame_buffer = None
+        self.buffer_initialized = False
+
+        # 特征提取网络
+        if with_feat:
+            self.resnet_feat_dim = 256
+            fnet = models.resnet50(pretrained=True)
+            self.ResNet50Truncated = nn.Sequential(*list(fnet.children())[:-5])
+
+            self.small_cnn_img = nn.Sequential(
+                nn.Conv2d(in_channels=self.resnet_feat_dim, out_channels=64, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_channels=64, out_channels=self.img_embedding, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(inplace=True)
+            )
+
+        if with_sseg and not (use_raw_sseg):
+            self.small_cnn_sseg = nn.Sequential(
+                nn.Conv2d(in_channels=self.sseg_labels, out_channels=64, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_channels=64, out_channels=self.sseg_embedding, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(inplace=True)
+            )
+
+        if with_dets and not (use_raw_dets):
+            self.small_cnn_det = nn.Sequential(
+                nn.Conv2d(in_channels=self.dets_nClasses, out_channels=64, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_channels=64, out_channels=self.dets_embedding, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(inplace=True)
+            )
+
+        
+        if update_type == "lstm":
+            self.lstm = nn.LSTM(input_size=self.map_embedding, hidden_size=self.map_embedding, num_layers=1)
+        elif update_type == "fc":
+            self.update_fc = nn.Linear(self.map_embedding * 2, self.map_embedding)
+        else:  # 'avg'
+            self.update_avg = nn.AvgPool1d(kernel_size=2)
+
+        
+        if self.loss_type != "BCE":
+            self.loss_CEL = nn.CrossEntropyLoss(ignore_index=-1)
+
+
+    def init_frame_buffer(self, batch_size):
+        """初始化历史帧缓冲区"""
+        self.frame_buffer = torch.zeros(
+            batch_size,
+            self.map_embedding,
+            self.global_map_dim[0],
+            self.global_map_dim[1],
+            self.window_size,
+            dtype=torch.float32
+        ).cuda()
+        self.buffer_initialized = True
+
+
+    def update_frame_buffer(self, new_observation, batch_size):
+        """更新滑动窗口缓冲区"""
+        if not self.buffer_initialized:
+            self.init_frame_buffer(batch_size)
+
+        # 滑动窗口：移除最旧的帧，添加新帧
+        self.frame_buffer[:, :, :, :, :-1] = self.frame_buffer[:, :, :, :, 1:].clone()
+        self.frame_buffer[:, :, :, :, -1] = new_observation
+
+    def get_temporal_features(self, current_frame_idx):
+        """获取用于时序融合的特征"""
+        if current_frame_idx < self.window_size - 1:
+            # 前几帧：只使用已有的帧
+            valid_frames = current_frame_idx + 1
+            return self.frame_buffer[:, :, :, :, :valid_frames]
+        else:
+            # 达到窗口大小后：使用完整窗口
+            return self.frame_buffer
+
+    def apply_temporal_fusion(self, features, current_frame_idx):
+        """应用时序Transformer融合"""
+        # features 的形状应该是 [B, d_model, H, W, valid_frames]
+        batch_size, d_model, h, w, valid_frames = features.shape
+
+        if current_frame_idx < self.window_size - 1:
+            # 前几帧直接返回最新的特征（最后一帧）
+            return features[:, :, :, :, -1]
+
+        # 重组数据用于Transformer处理
+        # [B, d_model, H, W, window_size] -> [B, H*W, window_size, d_model]
+        temporal_features = features.permute(0, 2, 3, 4, 1).contiguous()
+        temporal_features = temporal_features.view(batch_size, h * w, valid_frames, d_model)
+
+        # 通过Transformer融合
+        fused_features = self.temporal_transformer(temporal_features)
+
+        # 重组回原始形状: [B, H*W, d_model] -> [B, d_model, H, W]
+        fused_features = fused_features.view(batch_size, h, w, d_model)
+        fused_features = fused_features.permute(0, 3, 1, 2).contiguous()
+
+        return fused_features
+
+    def extract_img_feat(self, img_data, batch_size):
+        """修正后的特征提取函数"""
+        # 存储原始RGB图像用于CLIP处理
+        self.current_rgb_images = img_data.clone()
+
+        # ResNet特征提取
+        img_feat = self.ResNet50Truncated(img_data)
+        img_feat = F.interpolate(img_feat, size=(self.crop_size[1], self.crop_size[0]), mode='nearest')
+
+        return img_feat
+
+    # 初始化智能体在地图上的位置分布
+    def init_p(self, batch_size):
+        # Initialize the position (p0) in the center of the map at angle 0 (i.e. orientation index 0).
+        p0 = np.zeros((batch_size, self.orientations, self.global_map_dim[0], self.global_map_dim[1]), dtype=np.float32)
+        p0[:, 0, int(self.global_map_dim[0] / 2.0), int(self.global_map_dim[1] / 2.0)] = 1  # 14,14
+        return torch.tensor(p0, dtype=torch.float32).cuda()
+
+    def forward(self, local_info, update_type, input_flags, p_gt=None):
+        # 为整个剧集运行 MapNet
+        (img_data, points2D, local3D, sseg, dets) = local_info
+        batch_size = img_data.shape[0]
+        seq_len = img_data.shape[1]
+
+        # 提取图片特征
+        with_feat = input_flags[0]
+        if with_feat:
+            # *** 关键修正：保持原始形状用于CLIP处理 ***
+            original_img_data = img_data.clone()  # [B, T, 3, H, W]
+
+            img_data_flat = img_data.view(batch_size * seq_len, 3, self.crop_size[1], self.crop_size[0])
+            img_feat = self.extract_img_feat(img_data_flat, batch_size)
+            img_feat = img_feat.view(batch_size, seq_len, self.resnet_feat_dim, self.crop_size[1], self.crop_size[0])
+        else:
+            original_img_data = None
+            img_feat = torch.zeros(batch_size, seq_len, 1, self.crop_size[1], self.crop_size[0])
+
+        # 地面投影 - 传递原始图像
+        grid, map_occ = self.groundProjection(
+            img_feat_all=img_feat,
+            points2D_all=points2D,
+            local3D_all=local3D,
+            sseg_all=sseg,
+            dets_all=dets,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            input_flags=input_flags,
+            original_img_data=original_img_data  # *** 传递原始图像 ***
+        )
+
+        # 旋转网格的特征通道以获取旋转堆栈
+        grid_packed = grid.view(batch_size * seq_len, self.map_embedding, self.observation_dim[0], self.observation_dim[1])
+        rotation_stack_packed = self.rotational_sampler(grid=grid_packed)
+        rotation_stack = rotation_stack_packed.view(batch_size, seq_len, self.map_embedding, self.orientations, self.observation_dim[0], self.observation_dim[1])
+
+        # p_pred 是预测的位姿分布；map_pred用于存储地图特征的预测值
+        p_pred = np.zeros((batch_size, seq_len, self.orientations, self.global_map_dim[0], self.global_map_dim[1]), dtype=np.float32)
+        p_pred = torch.tensor(p_pred, dtype=torch.float32).cuda()
+        map_pred = np.zeros((batch_size, seq_len, self.map_embedding, self.global_map_dim[0], self.global_map_dim[1]), dtype=np.float32)
+        map_pred = torch.tensor(map_pred, dtype=torch.float32).cuda()
+
+        confidence_pred = np.zeros((batch_size, seq_len, self.orientations,
+                                    self.global_map_dim[0], self.global_map_dim[1]), dtype=np.float32)
+        confidence_pred = torch.tensor(confidence_pred, dtype=torch.float32).cuda()
+
+        self.buffer_initialized = False
+        for q in range(seq_len):
+            rotation_stack_step = rotation_stack[:, q, :, :, :, :]
+            if q == 0:
+                p_ = self.init_p(batch_size=batch_size).clone()
+                map_next = self.register_observation(rotation_stack=rotation_stack_step, p=p_, batch_size=batch_size)
+
+                # 使用confidence_branch计算置信度
+                confidence_ = self.confidence_branch(map_next)
+            else:
+                map_previous = map_next.clone()
+                p_, base_confidence = self.position_prediction(rotation_stack=rotation_stack_step,
+                                                               map_previous=map_previous, batch_size=batch_size)
+
+                if p_gt is not None:
+                    reg_obsv = self.register_observation(rotation_stack=rotation_stack_step, p=p_gt[:, q, :, :, :], batch_size=batch_size)
+                else:
+                    reg_obsv = self.register_observation(rotation_stack=rotation_stack_step, p=p_, batch_size=batch_size)
+
+                # 传递当前帧索引用于时序融合
+                map_next = self.update_map(reg_obsv, map_previous, batch_size=batch_size,
+                                           update_type=update_type, current_frame_idx=q)
+
+                # 使用confidence_branch计算置信度，结合基础置信度
+                network_confidence = self.confidence_branch(map_next)
+                confidence_ = 0.7 * network_confidence + 0.3 * base_confidence
+
+            p_pred[:, q, :, :, :] = p_
+            confidence_pred[:, q, :, :, :] = confidence_
+            map_pred[:, q, :, :, :] = map_next
+
+        return p_pred, map_pred, confidence_pred
+
+        ## grid：地面网格上的特征表示（通常用于后续地图构建）；map_occ：地面占用图（通常表示哪些区域被占据）
+
+    def build_loss(self, p_pred, confidence_pred, p_gt):
+        batch_size = p_pred.shape[0]
+        seq_len = p_pred.shape[1]
+
+        # 移除第一帧
+        p_pred = p_pred[:, 1:, :, :, :]
+        confidence_pred = confidence_pred[:, 1:, :, :, :]
+        p_gt = p_gt[:, 1:, :, :, :]
+
+        if self.loss_type == "BCE":
+            # 不确定性感知的BCE损失
+            p_pred_flat = p_pred.contiguous().view(batch_size * (seq_len - 1),
+                                                   self.orientations, self.global_map_dim[0], self.global_map_dim[1])
+            p_gt_flat = p_gt.contiguous().view(batch_size * (seq_len - 1),
+                                               self.orientations, self.global_map_dim[0], self.global_map_dim[1])
+            confidence_flat = confidence_pred.contiguous().view(batch_size * (seq_len - 1),
+                                                                self.orientations, self.global_map_dim[0], self.global_map_dim[1])
+
+            # 主要定位损失（由置信度加权）
+            localization_loss = F.binary_cross_entropy_with_logits(p_pred_flat, p_gt_flat, reduction='none')
+            weighted_loss = localization_loss / (confidence_flat + 1e-6)  # 高置信度 = 高权重
+
+            # 置信度正则化损失（防止过度自信）
+            confidence_reg = torch.mean(confidence_flat)  # 鼓励适度的置信度
+
+            # 总损失
+            total_loss = torch.mean(weighted_loss) + 0.1 * confidence_reg
+
+        elif self.loss_type == "CEL":
+            # 交叉熵损失的不确定性感知版本
+            p_pred_flat = p_pred.contiguous().view(batch_size * (seq_len - 1), -1)
+            p_gt_flat = p_gt.contiguous().view(batch_size * (seq_len - 1), -1)
+            confidence_flat = confidence_pred.contiguous().view(batch_size * (seq_len - 1),
+                                                                self.orientations, self.global_map_dim[0], self.global_map_dim[1])
+
+            # 将真值转换为类别索引
+            p_gt_indices = torch.argmax(p_gt_flat, dim=1)
+
+            # 计算交叉熵损失
+            ce_loss = F.cross_entropy(p_pred_flat, p_gt_indices, reduction='none')
+
+            # 置信度加权（取每个样本的平均置信度）
+            confidence_weight = torch.mean(confidence_flat.view(batch_size * (seq_len - 1), -1), dim=1)
+            weighted_loss = ce_loss / (confidence_weight + 1e-6)
+
+            # 置信度正则化
+            confidence_reg = torch.mean(confidence_weight)
+
+            # 总损失
+            total_loss = torch.mean(weighted_loss) + 0.1 * confidence_reg
+
+        else:
+            raise ValueError(f"Unsupported loss type: {self.loss_type}")
+
+        return total_loss
+
+    def register_observation(self, rotation_stack, p, batch_size, confidence=None):
+        reg_obsv = np.zeros((batch_size, self.map_embedding, self.global_map_dim[0], self.global_map_dim[1]), dtype=np.float32)
+        reg_obsv = torch.tensor(reg_obsv, dtype=torch.float32).cuda()
+
+        for i in range(batch_size):
+            filt = rotation_stack[i, :, :, :, :]
+            filt = filt.permute(1, 0, 2, 3)
+            p_in = p[i, :, :, :].unsqueeze(0)
+
+            # 如果提供了置信度，则进行加权
+            if confidence is not None:
+                confidence_weight = confidence[i, :, :, :].unsqueeze(0)
+                p_in = p_in * confidence_weight  # 置信度加权
+
+            reg = F.conv_transpose2d(input=p_in, weight=filt, padding=self.pad)
+            reg_obsv[i, :, :, :] = reg
+
+        return reg_obsv
+
+    def position_prediction(self, rotation_stack, map_previous, batch_size):
+        # Do the cross correlation with the existing map
+        corr_map = np.zeros((batch_size, self.orientations, self.global_map_dim[0], self.global_map_dim[1]), dtype=np.float32)
+        corr_map = torch.tensor(corr_map, dtype=torch.float32).cuda()
+
+        for b in range(batch_size):
+            map_ = map_previous[b, :, :, :].unsqueeze(0)  # 1 x n x h x w
+            for r in range(self.orientations):
+                # convolve each filter with the previous map
+                filt = rotation_stack[b, :, r, :, :].unsqueeze(0)  # 1 x n x s x s
+                corr_tmp = F.conv2d(input=map_, weight=filt, padding=self.pad)
+                corr_map[b, r, :, :] = corr_tmp
+
+        p_ = np.zeros((batch_size, self.orientations, self.global_map_dim[0], self.global_map_dim[1]), dtype=np.float32)
+        p_ = torch.tensor(p_, dtype=torch.float32).cuda()
+
+        for i in range(batch_size):
+            p_tmp = corr_map[i, :, :, :].view(-1)
+            p_tmp = p_tmp.view(self.orientations, self.global_map_dim[0], self.global_map_dim[1])
+            p_[i, :, :, :] = p_tmp
+
+        # 置信度估计
+        confidence_map = torch.zeros_like(p_)
+        for i in range(batch_size):
+            for r in range(self.orientations):
+                corr_values = corr_map[i, r, :, :]
+                # 计算每个位置的置信度
+                max_response = torch.max(corr_values)
+                mean_response = torch.mean(corr_values)
+                std_response = torch.std(corr_values)
+
+                # 置信度公式：结合峰值强度和分布集中度
+                confidence = (max_response - mean_response) / (std_response + 1e-6)
+                confidence_map[i, r, :, :] = torch.sigmoid(confidence)
+
+        return p_, confidence_map
+    #在定位阶段用不到forward_single_step
+    def forward_single_step(self, local_info, t, input_flags, map_previous=None, p_given=None, update_type="lstm"):
+        (img_data, points2D, local3D, sseg, dets) = local_info
+        batch_size = img_data.shape[0]
+
+        with_feat = input_flags[0]
+        if with_feat:
+            # *** 保存原始RGB图像用于CLIP ***
+            self.current_rgb_images = img_data.clone()
+            img_feat = self.extract_img_feat(img_data, batch_size)
+        else:
+            self.current_rgb_images = None
+            img_feat = torch.zeros(batch_size, 1, self.crop_size[1], self.crop_size[0])
+
+        # 地面投影处理
+        grid = torch.zeros((batch_size, self.map_embedding, self.observation_dim[0], self.observation_dim[1]),
+                           dtype=torch.float32).cuda()
+
+        for b in range(batch_size):
+            points2D_step = points2D[b]
+            local3D_step = local3D[b]
+            img_feat_step = img_feat[b, :, :, :].unsqueeze(0)
+            sseg_step = sseg[b, :, :, :].unsqueeze(0)
+            dets_step = dets[b, :, :, :].unsqueeze(0)
+
+
+            rgb_image = None
+            if self.current_rgb_images is not None:
+                rgb_image = self.current_rgb_images[b]  # [3, H, W]
+
+            grid_step, map_occ_step = self.groundProjectionStep(
+                img_feat=img_feat_step,
+                points2D=points2D_step,
+                local3D=local3D_step,
+                sseg=sseg_step,
+                dets=dets_step,
+                input_flags=input_flags,
+                rgb_image=rgb_image  # *** 传递RGB图像 ***
+            )
+            grid[b, :, :, :] = grid_step.squeeze(0)
+
+
+
+        rotation_stack = self.rotational_sampler(grid=grid)
+
+        if t == 0:
+            # 第一帧：重置缓冲区
+            self.buffer_initialized = False
+            p_ = self.init_p(batch_size=batch_size).clone()
+            confidence_ = torch.ones_like(p_) * 0.5
+            map_next = self.register_observation(rotation_stack=rotation_stack, p=p_,
+                                                 batch_size=batch_size, confidence=confidence_)
+        else:
+            if p_given is None:
+                p_, confidence_ = self.position_prediction(rotation_stack=rotation_stack,
+                                                           map_previous=map_previous, batch_size=batch_size)
+            else:
+                p_ = p_given
+                confidence_ = torch.ones_like(p_) * 0.8
+
+            reg_obsv = self.register_observation(rotation_stack=rotation_stack, p=p_,
+                                                 batch_size=batch_size, confidence=confidence_)
+
+            # 传递时间步索引用于时序融合
+            map_next = self.update_map(reg_obsv, map_previous, batch_size=batch_size,
+                                       update_type=update_type, current_frame_idx=t)
+
+
+        return p_, confidence_, map_next  # 现在返回三个值：位置、置信度、地图
+
+    def update_map(self, reg_obsv, map_previous, batch_size, update_type, current_frame_idx=0):
+        """更新地图，支持多帧时序融合"""
+
+        if update_type == "lstm" and self.use_temporal_fusion:
+            # 更新帧缓冲区
+            self.update_frame_buffer(reg_obsv, batch_size)
+
+            # 获取时序特征并应用融合
+            temporal_features = self.get_temporal_features(current_frame_idx)
+
+            if current_frame_idx >= self.window_size - 1:
+                # 应用时序融合
+                fused_reg_obsv = self.apply_temporal_fusion(temporal_features, current_frame_idx)
+            else:
+                # 前几帧使用原始特征
+                fused_reg_obsv = reg_obsv
+
+            # 使用融合后的特征进行LSTM更新
+            map_next = torch.zeros(
+                (batch_size, self.map_embedding, self.global_map_dim[0], self.global_map_dim[1]),
+                dtype=torch.float32
+            ).cuda()
+
+            # LSTM更新每个空间位置
+            for i in range(self.global_map_dim[0]):
+                for j in range(self.global_map_dim[1]):
+                    emb_in = fused_reg_obsv[:, :, i, j]  # b x n
+                    emb_hidden = map_previous[:, :, i, j]  # b x n
+                    emb_in = emb_in.unsqueeze(0)  # 添加序列长度维度
+                    emb_hidden = emb_hidden.unsqueeze(0)  # 添加LSTM层数维度
+                    hidden = (emb_hidden.contiguous(), emb_hidden.contiguous())
+                    lstm_out, hidden_out = self.lstm(emb_in, hidden)
+                    map_next[:, :, i, j] = lstm_out.squeeze(0)
+
+        elif update_type == "fc":
+            # FC更新保持不变
+            map2 = torch.cat((map_previous, reg_obsv), 1)
+            map_next = self.update_fc(map2.permute(0, 2, 3, 1))
+            map_next = torch.tanh(map_next)
+            map_next = map_next.permute(0, 3, 1, 2)
+
+        else:  # 'avg'
+            # 平均池化更新保持不变
+            map_next = torch.zeros(
+                (batch_size, self.map_embedding, self.global_map_dim[0], self.global_map_dim[1]),
+                dtype=torch.float32
+            ).cuda()
+            for i in range(self.global_map_dim[0]):
+                for j in range(self.global_map_dim[1]):
+                    vec1 = reg_obsv[:, :, i, j].unsqueeze(2)
+                    vec2 = map_previous[:, :, i, j].unsqueeze(2)
+                    vec = torch.cat((vec1, vec2), 2)
+                    avg_out = self.update_avg(vec).squeeze(2)
+                    map_next[:, :, i, j] = avg_out
+            map_next = torch.tanh(map_next)
+
+        return map_next
+
+
+    def rotational_sampler(self, grid, rot_init=True):
+        # The grid (after the groundProjection) is facing up
+        # We need to rotate it so as to face to the right (angle 0)
+        if rot_init:
+            grid = self.do_rotation(grid, angle=-np.pi/2.0)
+        # Rotate the grid's feature channels to obtain the rotational stack
+        rotation_stack = np.zeros((grid.shape[0], self.map_embedding, self.orientations, self.observation_dim[0], self.observation_dim[1]), dtype=np.float32 )
+        rotation_stack = torch.tensor(rotation_stack, dtype=torch.float32).cuda()
+        for i in range(self.orientations):
+            angle = 2*np.pi*(i/self.orientations)
+            rotation_stack[:,:,i,:,:] = self.do_rotation(grid, angle) #grid_trans
+        return rotation_stack
+
+
+    def do_rotation(self, grid, angle):
+        theta = torch.tensor([
+            [np.cos(angle), -np.sin(angle), 0],
+            [np.sin(angle), np.cos(angle), 0]
+        ], dtype=torch.float32).cuda()
+        theta = theta.unsqueeze(0).repeat(grid.shape[0], 1, 1)
+        grid_affine = F.affine_grid(theta, grid.size(), align_corners=True)  # Set align_corners=True
+        return F.grid_sample(grid, grid_affine, align_corners=True)  # Set align_corners=True
+
+    def groundProjectionStep(self, img_feat, points2D, local3D, sseg, dets, input_flags, rgb_image=None):
+        """修正后的地面投影函数"""
+        (with_feat, with_sseg, with_dets, use_raw_sseg, use_raw_dets) = input_flags
+
+        # 地面投影基础处理
+        map_coords, valid, map_occ = dh.discretize_coords(
+            x=local3D[:, 0], z=local3D[:, 2], map_dim=self.observation_dim, cell_size=self.cell_size)
+        map_occ = torch.tensor(map_occ, dtype=torch.float32).cuda()
+
+        points2D = points2D[valid, :]
+        map_coords = map_coords[valid, :]
+        grids = []
+
+        # ========== CLIP特征交互 ==========
+        if with_feat and rgb_image is not None:
+            try:
+                # 1. 获取ResNet特征并转换为地图特征
+                grid_img = self.bin_pooling(img_feat, points2D, map_coords)
+                grid_img_in = grid_img.unsqueeze(0)
+                map_features = self.small_cnn_img(grid_img_in.cuda())  # [1, img_embedding, H, W]
+
+                # 2. 获取CLIP文本特征
+                text_features = self.clip_extractor.text_features  # [num_obj, 512]
+                text_features = text_features.to(dtype=torch.float32)
+                text_features_proj = self.clip_proj(text_features)  # [num_obj, img_embedding]
+
+                # 3. 获取CLIP图像特征
+                with torch.no_grad():
+                    clip_result = self.clip_extractor.get_relevant_objects(rgb_image.unsqueeze(0))
+                    clip_img_feat = clip_result['image_features']  # [1, 512] 或 [1, 1, 512]
+                    relevance_mask = clip_result['relevance_mask']  # [1, num_obj] 或 [1, 1, num_obj]
+
+                    # 处理维度
+                    if len(clip_img_feat.shape) == 3:
+                        clip_img_feat = clip_img_feat.squeeze(1)
+                    if len(relevance_mask.shape) == 3:
+                        relevance_mask = relevance_mask.squeeze(1)
+
+                    clip_img_feat = clip_img_feat.to(dtype=torch.float32)
+                    clip_img_feat_proj = self.clip_proj(clip_img_feat)  # [1, img_embedding]
+
+                # 4. 处理相关类别
+                relevant_indices = torch.where(relevance_mask[0])[0]
+
+                if relevant_indices.numel() > 0:
+                    relevant_text_features = text_features_proj[relevant_indices]
+                    object_features = torch.cat([
+                        relevant_text_features.unsqueeze(0),
+                        clip_img_feat_proj.unsqueeze(1)
+                    ], dim=1)
+
+                    img_relevance = torch.ones(1, 1, device=relevance_mask.device, dtype=relevance_mask.dtype)
+                    extended_relevance_mask = torch.cat([
+                        relevance_mask[:, relevant_indices],
+                        img_relevance
+                    ], dim=1)
+                else:
+                    object_features = clip_img_feat_proj.unsqueeze(0).unsqueeze(1)
+                    extended_relevance_mask = torch.ones(1, 1, device=clip_img_feat_proj.device, dtype=torch.bool)
+
+                # 5. 应用注意力机制
+                B, d_model, H, W = map_features.shape
+                map_features_flat = map_features.permute(0, 2, 3, 1).reshape(B, H * W, d_model)
+
+                enhanced_map_features = self.object_attn(
+                    map_features_flat,
+                    object_features,
+                    relevance_mask=extended_relevance_mask
+                )
+
+                enhanced_map_features = enhanced_map_features.view(B, H, W, d_model).permute(0, 3, 1, 2)
+                grids.append(enhanced_map_features)
+
+            except Exception as e:
+                print(f"CLIP处理出错，使用普通特征: {e}")
+                # Fallback到普通特征处理
+                grid_img = self.bin_pooling(img_feat, points2D, map_coords)
+                grid_img_in = grid_img.unsqueeze(0)
+                map_features = self.small_cnn_img(grid_img_in.cuda())
+                grids.append(map_features)
+
+        elif with_feat:
+            # 没有RGB图像时的处理
+            grid_img = self.bin_pooling(img_feat, points2D, map_coords)
+            grid_img_in = grid_img.unsqueeze(0)
+            map_features = self.small_cnn_img(grid_img_in.cuda())
+            grids.append(map_features)
+
+        # ========== 其他特征处理 ==========
+        if with_sseg:
+            grid_sseg = self.label_pooling(sseg, points2D, map_coords)
+            grid_sseg_in = grid_sseg.unsqueeze(0)
+            if use_raw_sseg:
+                grids.append(grid_sseg_in)
+            else:
+                sseg_processed = self.small_cnn_sseg(grid_sseg_in)
+                grids.append(sseg_processed)
+
+        if with_dets:
+            grid_det = self.dets_pooling(dets, points2D, map_coords)
+            grid_det_in = grid_det.unsqueeze(0)
+            if use_raw_dets:
+                grids.append(grid_det_in)
+            else:
+                det_processed = self.small_cnn_det(grid_det_in)
+                grids.append(det_processed)
+
+        if len(grids) == 0:
+            raise Exception("No input grids!")
+
+        # 拼接特征
+        grid_out = torch.cat(grids, 1).cuda()
+
+        # *** 移除断言检查，因为现在维度是动态计算的 ***
+       # print(f"最终特征维度: {grid_out.shape}, 期望维度: [1, {self.map_embedding}, H, W]")
+
+        # 如果维度仍然不匹配，添加一个适配层
+        if grid_out.shape[1] != self.map_embedding:
+            if not hasattr(self, 'feature_adapter'):
+                self.feature_adapter = nn.Conv2d(grid_out.shape[1], self.map_embedding, 1).cuda()
+            grid_out = self.feature_adapter(grid_out)
+            #print(f"通过适配层调整后的维度: {grid_out.shape}")
+
+        return grid_out, map_occ
+
+
+
+    def bin_pooling(self, img_feat, points2D, map_coords):
+        # Bin pooling during ground projection of the features
+        grid = np.zeros((img_feat.shape[1], self.observation_dim[0], self.observation_dim[1]), dtype=np.float32)
+        grid = torch.tensor(grid, dtype=torch.float32).cuda()
+        pix_x, pix_y = points2D[:, 0], points2D[:, 1]
+        pix_feat = img_feat[0, :, pix_y, pix_x]
+        uniq_rows = np.unique(map_coords, axis=0)
+        for i in range(uniq_rows.shape[0]):
+            ucoord = uniq_rows[i, :]
+            ind = np.where((map_coords == ucoord).all(axis=1))[0]  # indices of where ucoord can be found in map_coords
+            # Features indices in the ind array belong to the same bin and have to be max-pooled
+            bin_feats = pix_feat[:, ind]  # [d x n] n:number of feature vectors projected, d:feat_dim
+            bin_feat, _ = torch.max(bin_feats, 1)  # [d]
+            grid[:, ucoord[1], ucoord[0]] = bin_feat
+        return grid
+
+        # 对所有投影到同一个地图格点的像素标签，统计各类别出现的频率，得到该格点的语义概率分布
+    def label_pooling(self, sseg, points2D, map_coords):
+        # Similar to bin_pooling() but instead features we pool the semantic labels
+        # For each bin get the frequencies of the class labels based on the labels projected
+        # Each grid location will hold a probability distribution over the semantic labels
+        grid = np.zeros((self.sseg_labels, self.observation_dim[0], self.observation_dim[1]), dtype=np.float32)
+        pix_x, pix_y = points2D[:, 0], points2D[:, 1]
+        pix_lbl = sseg[0, 0, pix_y, pix_x]
+        uniq_rows = np.unique(map_coords, axis=0)
+        for i in range(uniq_rows.shape[0]):
+            ucoord = uniq_rows[i, :]
+            ind = np.where((map_coords == ucoord).all(axis=1))[0]  # indices of where ucoord can be found in map_coords
+            bin_lbls = pix_lbl[ind]
+            # Labels are from 0-39 where 0:wall ... 39:other_prop
+            # hist, bins = np.histogram(bin_lbls, bins=list(range(self.sseg_labels+1)))
+            bin_lbls = bin_lbls.cpu() if bin_lbls.is_cuda else bin_lbls
+            hist, bins = np.histogram(bin_lbls.numpy(), bins=list(range(self.sseg_labels + 1)))
+            # 修改后
+            hist = hist / float(bin_lbls.shape[0])
+            grid[:, ucoord[1], ucoord[0]] = hist
+        grid = torch.tensor(grid, dtype=torch.float32).cuda()
+        return grid
+
+    # 对所有投影到同一个地图格点的检测分数（每个类别），进行均值池化（average pooling），得到该格点的检测分数分布
+    def dets_pooling(self, dets, points2D, map_coords):
+        # Bin pooling of the detection masks. Detection scores in the same bin are averaged.
+        grid = np.zeros((self.dets_nClasses, self.observation_dim[0], self.observation_dim[1]), dtype=np.float32)
+        pix_x, pix_y = points2D[:, 0], points2D[:, 1]
+        pix_dets = dets[0, :, pix_y, pix_x]
+        if pix_dets.is_cuda:
+            pix_dets = pix_dets.cpu()  # 确保张量在 CPU 上
+        uniq_rows = np.unique(map_coords, axis=0)
+        for i in range(uniq_rows.shape[0]):
+            ucoord = uniq_rows[i, :]
+            ind = np.where((map_coords == ucoord).all(axis=1))[0]  # 寻找坐标在 map_coords 中的索引
+            bin_dets = pix_dets[:, ind]  # 所有在同一格中的检测结果
+            bin_det = bin_dets.mean(1)
+            grid[:, ucoord[1], ucoord[0]] = bin_det.numpy()  # 确保使用.numpy()之前，bin_det在 CPU 上
+        grid = torch.tensor(grid, dtype=torch.float32).cuda()  # 将结果转回 GPU
+
+        return grid
+
+    def groundProjection(self, img_feat_all, points2D_all, local3D_all, sseg_all, dets_all, batch_size, seq_len,
+                         input_flags, original_img_data=None):  # *** 添加原始图像参数 ***
+        """修正后的批量地面投影"""
+        grid = torch.zeros((batch_size, seq_len, self.map_embedding, self.observation_dim[0], self.observation_dim[1]),
+                           dtype=torch.float32).cuda()
+        map_occ = torch.zeros((batch_size, seq_len, 1, self.observation_dim[0], self.observation_dim[1]),
+                              dtype=torch.float32).cuda()
+
+        for b in range(batch_size):
+            points2D_seq = points2D_all[b]
+            local3D_seq = local3D_all[b]
+            for q in range(seq_len):
+                points2D_step = points2D_seq[q]
+                local3D_step = local3D_seq[q]
+                img_feat_step = img_feat_all[b, q, :, :, :].unsqueeze(0)
+                sseg_step = sseg_all[b, q, :, :, :].unsqueeze(0)
+                dets_step = dets_all[b, q, :, :, :].unsqueeze(0)
+
+                # *** 关键修正：正确获取RGB图像 ***
+                rgb_image = None
+                if original_img_data is not None:
+                    rgb_image = original_img_data[b, q]  # [3, H, W]
+
+                grid_step, map_occ_step = self.groundProjectionStep(
+                    img_feat=img_feat_step,
+                    points2D=points2D_step,
+                    local3D=local3D_step,
+                    sseg=sseg_step,
+                    dets=dets_step,
+                    input_flags=input_flags,
+                    rgb_image=rgb_image
+                )
+                grid[b, q, :, :, :] = grid_step.squeeze(0)
+                map_occ[b, q, :, :, :] = map_occ_step.squeeze(0)
+        return grid, map_occ
+
+</pre>
+        </div>
+      </div>
     </div>
-  </section>
+    <div class="col-12 col-md-6 mb-4">
+      <div class="card">
+        <div class="card-header">model.py</div>
+        <div class="card-body" style="max-height:400px; overflow:auto; font-family:monospace; background:#f8f9fa;">
+<pre>
+# 这里放你的model.py代码内容
+class Model:
+    # ...
+    pass
+</pre>
+        </div>
+      </div>
+    </div>
+    <!-- 继续添加更多代码块，如下 -->
+    <!-- code3.py -->
+    <div class="col-12 col-md-6 mb-4">
+      <div class="card">
+        <div class="card-header">code3.py</div>
+        <div class="card-body" style="max-height:400px; overflow:auto; font-family:monospace; background:#f8f9fa;">
+<pre>
+# 这里放你的第三份代码
+</pre>
+        </div>
+      </div>
+    </div>
+    <!-- code4.py -->
+    <div class="col-12 col-md-6 mb-4">
+      <div class="card">
+        <div class="card-header">code4.py</div>
+        <div class="card-body" style="max-height:400px; overflow:auto; font-family:monospace; background:#f8f9fa;">
+<pre>
+# 这里放你的第四份代码
+</pre>
+        </div>
+      </div>
+    </div>
+    <!-- code5.py -->
+    <div class="col-12 col-md-6 mb-4">
+      <div class="card">
+        <div class="card-header">code5.py</div>
+        <div class="card-body" style="max-height:400px; overflow:auto; font-family:monospace; background:#f8f9fa;">
+<pre>
+# 这里放你的第五份代码
+</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
   <!-- 页脚 -->
   <footer class="bg-light text-center py-3">
     &copy; 2025 Yuhao Wang<br>
@@ -133,6 +1198,7 @@ Active visual search (AVS) presents substantial challenges for autonomous agents
   </footer>
 </body>
 </html>
+
 
 
 
